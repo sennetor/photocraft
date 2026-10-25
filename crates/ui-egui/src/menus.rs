@@ -76,11 +76,12 @@ pub fn invoke(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str, params: Va
     if crate::discard_ui::intercept(app, id, &params) {
         return Ok(Value::Null);
     }
-    let r = invoke_unguarded(app, ctx, id, params)?;
-    // Object to Layer cuts the object out even when the fill fails; say so.
-    if id == "layer.objectToLayer" {
-        crate::fill_dialog::report(app, &r);
-    }
+    // Object to Layer changes nothing when it cannot fill the hole; offer the plain cut.
+    let r = invoke_unguarded(app, ctx, id, params).inspect_err(|e| {
+        if id == "layer.objectToLayer" {
+            crate::fill_dialog::offer_cut(app, e);
+        }
+    })?;
     // The palette's empty-query list (UI-217-7); opening the palette isn't a command to recall.
     if id != "edit.search" {
         crate::palette::note_recent(ctx, id);

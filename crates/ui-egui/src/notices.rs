@@ -34,6 +34,18 @@ pub struct Notice {
     /// and is reset while the pointer rests on the stack (issue #2022). `None` until first shown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shown_at: Option<f64>,
+    /// A button that runs a command and dismisses the notice (an explicit way on after a failure).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<NoticeAction>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NoticeAction {
+    /// English; translated when drawn.
+    pub label: String,
+    pub command: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
 }
 
 impl Notice {
@@ -47,7 +59,7 @@ impl Notice {
 /// Show a notice (newest last); returns its id.
 pub fn post(app: &mut PhotocraftApp, title: impl Into<String>, lines: Vec<String>, error: bool, dismiss_pref: Option<&str>) -> u64 {
     let id = app.ui.alloc_id();
-    app.ui.notices.push(Notice { id, title: title.into(), lines, error, dismiss_pref: dismiss_pref.map(str::to_owned), args: Vec::new(), shown_at: None });
+    app.ui.notices.push(Notice { id, title: title.into(), lines, error, dismiss_pref: dismiss_pref.map(str::to_owned), args: Vec::new(), shown_at: None, action: None });
     cap_notices(app);
     id
 }
@@ -195,6 +207,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
     }
     let t = crate::theme::Tokens::get(ctx);
     let mut dismiss_id = None;
+    let mut acted = None;
     // Clear the status bar (~24 px) and leave the dock's edge some air.
     let area = egui::Area::new(egui::Id::new("photocraft-notices"))
         .order(egui::Order::Foreground)
@@ -228,12 +241,24 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                             let text = crate::i18n::fmt(tl!("…and {n} more"), &[("n", &(n.lines.len() - MAX_LINES).to_string())]);
                             ui.label(egui::RichText::new(text).color(t.text_faint));
                         }
+                        if let Some(a) = &n.action {
+                            ui.add_space(4.0);
+                            if crate::widgets::secondary_button(ui, crate::i18n::t(&a.label), 160.0).clicked() {
+                                acted = Some((n.id, a.clone()));
+                            }
+                        }
                     });
                 ui.add_space(6.0);
             }
         });
     if let Some(id) = dismiss_id {
         dismiss(app, id);
+    }
+    if let Some((id, a)) = acted {
+        dismiss(app, id);
+        if let Err(e) = crate::menus::invoke(app, ctx, &a.command, a.params) {
+            error(app, e);
+        }
     }
     let (auto_hide, duration) = {
         let i = &app.session.prefs().interface;

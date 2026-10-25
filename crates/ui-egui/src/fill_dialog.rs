@@ -70,17 +70,24 @@ pub fn params(f: &Map<String, Value>) -> Value {
 }
 
 pub fn confirm(app: &mut PhotocraftApp, f: &Map<String, Value>) -> Result<Value, String> {
-    let r = app.run(ENGINE_COMMAND, params(f))?;
-    report(app, &r);
-    Ok(r)
+    app.run(ENGINE_COMMAND, params(f)).inspect_err(|e| {
+        offer_cut(app, e);
+    })
 }
 
-/// Tells the user in the status bar when the object was cut out but the hole was not filled.
-pub fn report(app: &mut PhotocraftApp, result: &Value) {
-    if let Some(why) = result.get("warning").and_then(Value::as_str) {
-        app.ui.status = why.to_string();
-        app.ui.status_error = true;
+/// When the hole could not be filled (no service, or the fill failed), the document is unchanged:
+/// say why, and offer cutting the object out without filling as an explicit choice. `true` when
+/// `error` was such a failure (and is now reported).
+pub fn offer_cut(app: &mut PhotocraftApp, error: &str) -> bool {
+    if !error.contains(photocraft_engine::object_to_layer_cmds::NOT_FILLED) {
+        return false;
     }
+    let message = format!("{}: {error}", tl!("Object to Layer"));
+    crate::notices::error(app, message);
+    if let Some(n) = app.ui.notices.last_mut() {
+        n.action = Some(crate::notices::NoticeAction { label: "Cut without filling".into(), command: ENGINE_COMMAND.into(), params: json!({"fill": false}) });
+    }
+    true
 }
 
 /// The preset the values match, if any.
@@ -243,6 +250,33 @@ mod tests {
         assert_eq!(current_preset(&dialog("fooocus", false, 50, "")), Some("prompted"));
         assert_eq!(current_preset(&dialog("fooocus", false, 10, "")), None, "by hand: Custom");
         assert_eq!(current_preset(&dialog("juggernaut", false, 62, "")), None);
+    }
+
+    #[test]
+    fn an_unfilled_hole_changes_nothing_and_offers_cut_without_filling() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({"width": 32, "height": 32})).unwrap();
+        app.run("select.rect", json!({"x": 2, "y": 2, "width": 8, "height": 8})).unwrap();
+        let ctx = egui::Context::default();
+        // No AI service is set up: the command fails and the document keeps one layer.
+        if remote::fill_config().is_some() {
+            return;
+        }
+        let err = crate::menus::invoke(&mut app, &ctx, ENGINE_COMMAND, Value::Null).unwrap_err();
+        assert!(err.contains("AI Integrations"), "{err}");
+        assert_eq!(app.session.active().unwrap().doc.layers.len(), 1);
+        let n = app.ui.notices.last().unwrap();
+        assert!(n.error);
+        let a = n.action.clone().unwrap();
+        assert_eq!((a.label.as_str(), a.command.as_str(), &a.params), ("Cut without filling", ENGINE_COMMAND, &json!({"fill": false})));
+        // The button's command is the explicit cut.
+        let r = crate::menus::invoke(&mut app, &ctx, &a.command, a.params).unwrap();
+        assert_eq!(r["filled"], json!(false));
+        assert_eq!(app.session.active().unwrap().doc.layers.len(), 2);
+        // Other failures are not mistaken for an unfilled hole.
+        let before = app.ui.notices.len();
+        assert!(!offer_cut(&mut app, "make a selection first"));
+        assert_eq!(app.ui.notices.len(), before);
     }
 
     #[test]

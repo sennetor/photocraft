@@ -9,10 +9,12 @@
 //!   area is blended back into the full-resolution layer. Which model fills it is a preference
 //!   (`integrations.fillMethod`: `fast`, or a generative model such as `sdxl` or `juggernaut`) or
 //!   the command's `method` parameter.
-//! * Without a service, or when it fails, the object is still cut out and the hole is left as
-//!   Layer via Cut leaves it (transparent, or the background colour on the Background layer); the
-//!   answer says why. Nothing is uploaded unless a service is set up (Preferences › AI
-//!   Integrations; see [`crate::remote`]).
+//! * Without a service, or when the fill fails or is cancelled, the command fails and the document
+//!   is left exactly as it was: a command that promises a filled background never quietly turns
+//!   into Layer via Cut. Cutting without filling is an explicit choice, `fill: false` (the UI offers
+//!   it as "Cut without filling"): the hole is then left as Layer via Cut leaves it (transparent,
+//!   or the background colour on the Background layer). Nothing is uploaded unless a service is
+//!   set up (Preferences › AI Integrations; see [`crate::remote`]).
 //!
 //! The whole command is one undo step.
 
@@ -74,13 +76,6 @@ struct Fill {
     model: String,
 }
 
-/// What the worker hands to the apply step.
-struct Done {
-    fill: Option<Fill>,
-    /// Why there is no fill, when there is none and a service was asked.
-    warning: Option<String>,
-}
-
 fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let source = layer_param(s, p)?;
     let d = s.active().ok_or(EngineError::NoDocument)?;
@@ -126,33 +121,35 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let refine = unit("refine", if st.fill_improve_detail { 0.5 } else { 0.0 })?;
     // The extra controls are for the generative models; the quick filler ignores them.
     let params = InpaintParams { method, dilate: 0, steps: 30, prompt, seed, context: Some(context), refine: Some(refine) };
-    let cfg = if want_fill { crate::remote::fill_config() } else { None };
-    let skipped = if !want_fill { Some("fill was switched off") } else if cfg.is_none() { Some("no AI service is set up for filling (Edit › Preferences › AI Integrations)") } else { None };
 
     let bg = s.tools.background;
     let apply_name = source_name.clone();
-    let finish = move |s: &mut Session, done: Done| apply(s, done, source, &apply_name, bg);
-    match cfg {
-        Some(cfg) => {
-            let params2 = params.clone();
-            crate::jobs::run(s, LABEL, true, move |ctx| Ok(work(ctx, &cfg, &doc, source, grow, &params2)), finish)
-        }
-        // Nothing to wait for: cut the object out now.
-        None => finish(s, Done { fill: None, warning: skipped.map(str::to_string) }),
+    let finish = move |s: &mut Session, fill: Option<Fill>| apply(s, fill, source, &apply_name, bg);
+    if !want_fill {
+        // Cut without filling, asked for explicitly: nothing to wait for.
+        return finish(s, None);
     }
+    let cfg = crate::remote::fill_config().ok_or_else(|| EngineError::Other(format!("{NOT_FILLED}: no AI service is set up for filling (Edit › Preferences › AI Integrations). To cut the object out anyway, use Cut without filling (`fill: false`).")))?;
+    // A failed or cancelled fill fails the job, and a failed job leaves the document unchanged.
+    crate::jobs::run(
+        s,
+        LABEL,
+        true,
+        move |ctx| {
+            fill_via_service(ctx, &cfg, &doc, source, grow, &params).map(Some).map_err(|e| match e {
+                EngineError::Cancelled => e,
+                e => {
+                    log::warn!("Object to Layer: the fill failed: {e}");
+                    EngineError::Other(format!("{NOT_FILLED}: {e}"))
+                }
+            })
+        },
+        finish,
+    )
 }
 
-/// The worker: upload, wait for the service (reporting progress), download. A service failure is
-/// not an error (the object is still cut out): it becomes the `warning`. Cancelling is.
-fn work(ctx: &JobCtx, cfg: &RemoteConfig, doc: &Arc<Document>, source: LayerId, grow: u32, params: &InpaintParams) -> Done {
-    match fill_via_service(ctx, cfg, doc, source, grow, params) {
-        Ok(fill) => Done { fill: Some(fill), warning: None },
-        Err(e) => {
-            log::warn!("Object to Layer: the fill failed: {e}");
-            Done { fill: None, warning: Some(format!("the hole was not filled: {e}")) }
-        }
-    }
-}
+/// How a failure to fill starts, so the UI can tell it from other errors and offer to cut anyway.
+pub const NOT_FILLED: &str = "the hole could not be filled, so nothing was changed";
 
 fn fill_via_service(ctx: &JobCtx, cfg: &RemoteConfig, doc: &Arc<Document>, source: LayerId, grow: u32, params: &InpaintParams) -> Result<Fill> {
     ctx.progress(0.0, "Preparing the image");
@@ -359,16 +356,16 @@ fn blend_fill(doc: &mut Document, layer: LayerId, f: &Fill) -> Result<()> {
     Ok(())
 }
 
-/// Cuts the object onto its own layer above the source and fills (or clears) the hole, as one
-/// undo step.
-fn apply(s: &mut Session, done: Done, source: LayerId, source_name: &str, background: [f32; 4]) -> Result<Value> {
+/// Cuts the object onto its own layer above the source and fills the hole (or, for an explicit
+/// cut without filling, clears it), as one undo step.
+fn apply(s: &mut Session, fill: Option<Fill>, source: LayerId, source_name: &str, background: [f32; 4]) -> Result<Value> {
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let sel = d.doc.selection.as_ref().ok_or_else(|| EngineError::Other("the selection is gone".into()))?;
     let surf = d.doc.layer(source).and_then(Layer::surface).ok_or(EngineError::NoLayer(source))?;
     let object = crate::edit_cmds::lift_selection(surf, sel, d.doc.bounds())?;
-    let (filled, model, warning) = (done.fill.is_some(), done.fill.as_ref().map(|f| f.model.clone()), done.warning);
+    let (filled, model) = (fill.is_some(), fill.as_ref().map(|f| f.model.clone()));
     let nid = s.edit(LABEL, move |doc, active| {
-        match &done.fill {
+        match &fill {
             Some(f) => blend_fill(doc, source, f)?,
             None => crate::edit_cmds::clear_selected(doc, source, background)?,
         }
@@ -381,7 +378,7 @@ fn apply(s: &mut Session, done: Done, source: LayerId, source_name: &str, backgr
         Ok(nid)
     })?;
     log::info!("object to layer from \"{source_name}\": filled={filled}");
-    Ok(json!({ "layer": nid.0, "filled": filled, "model": model, "warning": warning }))
+    Ok(json!({ "layer": nid.0, "filled": filled, "model": model }))
 }
 
 /// Object to Layer command spec (the selection's context menu).
@@ -391,7 +388,7 @@ pub fn specs() -> Vec<CommandSpec> {
         label: LABEL,
         menu: &[],
         shortcut: None,
-        params: r##"{"layer":id?,"method":"fast"|<generative model id, e.g. sdxl, juggernaut>=prefs,"fill":bool=true,"grow":0..64=8,"prompt":str?,"context":0..1=prefs,"refine":0..1=prefs,"seed":int?} → {layer,filled,model,warning} (cuts the selected pixels onto a new layer above the source and fills the hole through the AI service chosen in Preferences › AI Integrations; with no service, or if it fails, the hole is left as Layer via Cut leaves it and `warning` says why)"##,
+        params: r##"{"layer":id?,"method":"fast"|<generative model id, e.g. sdxl, juggernaut>=prefs,"fill":bool=true,"grow":0..64=8,"prompt":str?,"context":0..1=prefs,"refine":0..1=prefs,"seed":int?} → {layer,filled,model} (cuts the selected pixels onto a new layer above the source and fills the hole through the AI service chosen in Preferences › AI Integrations; with no service, or if the fill fails or is cancelled, it fails and the document is unchanged; `fill: false` cuts without filling, leaving the hole as Layer via Cut does)"##,
         enabled,
         run,
         journal: true,
@@ -426,51 +423,109 @@ mod tests {
         Reply(status, "application/json", body.as_bytes().to_vec())
     }
 
-    /// A loopback server answering the next requests in order; returns each request line.
-    fn serve(replies: Vec<Reply>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    /// Waits (up to 10 s) for the next connection and reads its request; returns the stream and
+    /// the request line, or `None` when nobody connected.
+    fn next_request(l: &TcpListener) -> Option<(std::net::TcpStream, String)> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut s = loop {
+            match l.accept() {
+                Ok((s, _)) => break s,
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                Err(_) => return None,
+            }
+        };
+        s.set_nonblocking(false).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 8192];
+        let head_end = loop {
+            if let Some(p) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                break p + 4;
+            }
+            let n = s.read(&mut buf).unwrap();
+            if n == 0 {
+                break got.len();
+            }
+            got.extend(&buf[..n]);
+        };
+        let head = String::from_utf8_lossy(&got[..head_end]).to_string();
+        let want = head.to_ascii_lowercase().lines().find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok())).unwrap_or(0);
+        while got.len() < head_end + want {
+            let n = s.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend(&buf[..n]);
+        }
+        Some((s, head.lines().next().unwrap_or("").to_string()))
+    }
+
+    fn reply(s: &mut std::net::TcpStream, Reply(status, ct, body): Reply) {
+        write!(s, "HTTP/1.1 {status}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+        s.write_all(&body).unwrap();
+    }
+
+    fn listen() -> (TcpListener, String) {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         l.set_nonblocking(true).unwrap();
         let url = format!("http://{}/photocraft/v1", l.local_addr().unwrap());
+        (l, url)
+    }
+
+    /// A loopback server answering the next requests in order; returns each request line.
+    fn serve(replies: Vec<Reply>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let (l, url) = listen();
         let h = std::thread::spawn(move || {
             let mut seen = Vec::new();
-            for Reply(status, ct, body) in replies {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                let mut s = loop {
-                    match l.accept() {
-                        Ok((s, _)) => break s,
-                        Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
-                        Err(_) => return seen,
-                    }
-                };
-                s.set_nonblocking(false).unwrap();
-                let mut got = Vec::new();
-                let mut buf = [0u8; 8192];
-                let head_end = loop {
-                    if let Some(p) = got.windows(4).position(|w| w == b"\r\n\r\n") {
-                        break p + 4;
-                    }
-                    let n = s.read(&mut buf).unwrap();
-                    if n == 0 {
-                        break got.len();
-                    }
-                    got.extend(&buf[..n]);
-                };
-                let head = String::from_utf8_lossy(&got[..head_end]).to_string();
-                let want = head.to_ascii_lowercase().lines().find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok())).unwrap_or(0);
-                while got.len() < head_end + want {
-                    let n = s.read(&mut buf).unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    got.extend(&buf[..n]);
-                }
-                write!(s, "HTTP/1.1 {status}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
-                s.write_all(&body).unwrap();
-                seen.push(head.lines().next().unwrap_or("").to_string());
+            for r in replies {
+                let Some((mut s, line)) = next_request(&l) else { return seen };
+                reply(&mut s, r);
+                seen.push(line);
             }
             seen
         });
         (url, h)
+    }
+
+    /// A loopback service whose fill job never finishes: it accepts the job and answers "running"
+    /// until the job is cancelled (a DELETE); returns each request line.
+    fn serve_until_cancelled() -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let (l, url) = listen();
+        let h = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            while let Some((mut s, line)) = next_request(&l) {
+                let done = line.starts_with("DELETE");
+                let r = if line.starts_with("POST") {
+                    json_reply("202 Accepted", r#"{"job_id":"01JFILL","state":"queued"}"#)
+                } else if done {
+                    json_reply("204 No Content", "")
+                } else {
+                    json_reply("200 OK", r#"{"state":"running","step":1,"steps":30}"#)
+                };
+                reply(&mut s, r);
+                seen.push(line);
+                if done {
+                    break;
+                }
+            }
+            seen
+        });
+        (url, h)
+    }
+
+    /// What must not change when the command does not run: the document snapshot itself, its
+    /// undo history and its selection.
+    fn assert_unchanged(s: &Session, before: &Arc<Document>, steps: usize) {
+        let st = s.active().unwrap();
+        assert!(Arc::ptr_eq(&st.doc, before), "the document was replaced");
+        assert_eq!(st.history.past_len(), steps, "no undo step was added");
+        assert_eq!(st.doc.layers.len(), 1, "no object layer");
+        assert!(st.doc.selection.is_some(), "the selection is kept, ready for another try");
+        assert!(px(s, 0, 32, 24)[2] > 0.85, "the object is still in the photo");
+    }
+
+    fn snapshot(s: &Session) -> (Arc<Document>, usize) {
+        let st = s.active().unwrap();
+        (Arc::clone(&st.doc), st.history.past_len())
     }
 
     fn configure(url: &str) {
@@ -544,37 +599,84 @@ mod tests {
     }
 
     #[test]
-    fn a_failing_service_still_cuts_the_object_out_and_says_why() {
+    fn a_failing_service_changes_nothing_and_says_why() {
         let (url, h) = serve(vec![json_reply("401 Unauthorized", r#"{"title":"Invalid API key","status":401}"#)]);
         configure(&url);
         let mut s = session_with_object();
-        let r = s.execute(CMD, json!({})).unwrap();
-        assert_eq!(r["filled"].as_bool(), Some(false));
-        let why = r["warning"].as_str().unwrap();
-        assert!(why.contains("401") && !why.contains("pc_test_key"), "{why}");
-        assert_eq!(s.active().unwrap().doc.layers.len(), 2);
-        assert!(px(&s, 1, 30, 22)[2] > 0.85, "the object is on its layer");
+        let (before, steps) = snapshot(&s);
+        let why = s.execute(CMD, json!({})).unwrap_err().to_string();
+        assert!(why.contains(NOT_FILLED) && why.contains("401") && !why.contains("pc_test_key"), "{why}");
+        assert_unchanged(&s, &before, steps);
         h.join().unwrap();
         crate::remote::set_test_config(None);
     }
 
     #[test]
-    fn without_a_service_it_behaves_like_layer_via_cut() {
+    fn a_fill_job_the_service_fails_changes_nothing() {
+        let (url, h) = serve(vec![
+            json_reply("202 Accepted", r#"{"job_id":"01JFILL","state":"queued"}"#),
+            json_reply("200 OK", r#"{"state":"failed","error":"out of GPU memory"}"#),
+        ]);
+        configure(&url);
+        let mut s = session_with_object();
+        let (before, steps) = snapshot(&s);
+        let why = s.execute(CMD, json!({})).unwrap_err().to_string();
+        assert!(why.contains(NOT_FILLED) && why.contains("out of GPU memory"), "{why}");
+        assert_unchanged(&s, &before, steps);
+        h.join().unwrap();
+        crate::remote::set_test_config(None);
+    }
+
+    #[test]
+    fn without_a_service_it_changes_nothing_and_points_at_the_settings_and_the_explicit_cut() {
         crate::remote::set_test_config(None);
         let mut s = session_with_object();
-        let r = s.execute(CMD, json!({})).unwrap();
-        assert_eq!(r["filled"].as_bool(), Some(false));
-        assert!(r["warning"].as_str().unwrap().contains("AI Integrations"));
-        assert_eq!(s.active().unwrap().doc.layers.len(), 2);
-        assert!(px(&s, 1, 30, 22)[2] > 0.85);
+        let (before, steps) = snapshot(&s);
+        let why = s.execute(CMD, json!({})).unwrap_err().to_string();
+        assert!(why.contains(NOT_FILLED) && why.contains("AI Integrations") && why.contains("fill: false"), "{why}");
+        assert_unchanged(&s, &before, steps);
+    }
+
+    #[test]
+    fn cancelling_the_fill_changes_nothing_and_cancels_the_server_job() {
+        let (url, h) = serve_until_cancelled();
+        configure(&url);
+        let mut s = session_with_object();
+        let (before, steps) = snapshot(&s);
+        let id = match s.start(CMD, json!({})).unwrap() {
+            crate::jobs::Started::Job(id) => id,
+            crate::jobs::Started::Done(v) => panic!("expected a background job: {v}"),
+        };
+        // Cancel once the job is with the service, as Esc does while it fills.
+        let t = Instant::now();
+        while s.job(id).is_some_and(|j| j.progress < 0.05) {
+            assert!(t.elapsed() < Duration::from_secs(30), "the job never reached the service");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(s.cancel_job(id));
+        s.join_cancelled_jobs();
+        assert!(matches!(s.wait_job(id), Err(EngineError::Cancelled)));
+        assert!(s.poll_jobs().iter().all(|e| e.id != id || e.outcome == crate::jobs::JobOutcome::Cancelled));
+        assert_unchanged(&s, &before, steps);
+        let reqs = h.join().unwrap();
+        assert!(reqs.last().is_some_and(|r| r.starts_with("DELETE")), "the server's GPU is freed: {reqs:?}");
+        crate::remote::set_test_config(None);
+    }
+
+    #[test]
+    fn cut_without_filling_is_the_explicit_choice_and_works_like_layer_via_cut() {
+        // `fill: false` skips the service even when one is set up (nothing listens on port 1).
+        configure("http://127.0.0.1:1/photocraft/v1");
+        let mut s = session_with_object();
+        let steps = s.active().unwrap().history.past_len();
+        let r = s.execute(CMD, json!({"fill": false})).unwrap();
+        assert_eq!((r["filled"].as_bool(), r.get("warning")), (Some(false), None), "{r}");
+        let st = s.active().unwrap();
+        assert_eq!((st.doc.layers.len(), st.history.past_len()), (2, steps + 1));
+        assert!(px(&s, 1, 30, 22)[2] > 0.85, "the object is on its layer");
         // The Background cannot hold a hole: it takes the background colour (white by default).
         let hole = px(&s, 0, 32, 24);
         assert!(hole[0] > 0.9 && hole[1] > 0.9 && hole[2] > 0.9, "{hole:?}");
-        // `fill: false` skips the service even when one is set up.
-        configure("http://127.0.0.1:1/photocraft/v1");
-        let mut s = session_with_object();
-        let r = s.execute(CMD, json!({"fill": false})).unwrap();
-        assert_eq!(r["filled"].as_bool(), Some(false));
         crate::remote::set_test_config(None);
     }
 
